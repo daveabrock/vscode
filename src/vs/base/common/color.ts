@@ -114,7 +114,7 @@ export class HSLA {
 		return new HSLA(h, s, l, a);
 	}
 
-	private static _hue2rgb(p: number, q: number, t: number) {
+	private static _hue2rgb(p: number, q: number, t: number): number {
 		if (t < 0) {
 			t += 1;
 		}
@@ -399,8 +399,24 @@ export class Color {
 		return new Color(new RGBA(r, g, b, a));
 	}
 
+	flatten(...backgrounds: Color[]): Color {
+		const background = backgrounds.reduceRight((accumulator, color) => {
+			return Color._flatten(color, accumulator);
+		});
+		return Color._flatten(this, background);
+	}
+
+	private static _flatten(foreground: Color, background: Color) {
+		const backgroundAlpha = 1 - foreground.rgba.a;
+		return new Color(new RGBA(
+			backgroundAlpha * background.rgba.r + foreground.rgba.a * foreground.rgba.r,
+			backgroundAlpha * background.rgba.g + foreground.rgba.a * foreground.rgba.g,
+			backgroundAlpha * background.rgba.b + foreground.rgba.a * foreground.rgba.b
+		));
+	}
+
 	toString(): string {
-		return Color.Format.CSS.format(this);
+		return '' + Color.Format.CSS.format(this);
 	}
 
 	static getLighterColor(of: Color, relative: Color, factor?: number): Color {

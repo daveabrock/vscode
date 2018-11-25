@@ -3,11 +3,8 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-'use strict';
-
 import { CommandsRegistry } from 'vs/platform/commands/common/commands';
 import { IClipboardService } from 'vs/platform/clipboard/common/clipboardService';
-import { IEnvironmentService } from 'vs/platform/environment/common/environment';
 
 
 interface IRequire {
@@ -110,12 +107,6 @@ function getStats(): Map<LoaderEventType, Tick[]> {
 CommandsRegistry.registerCommand('dev.stats.loader', accessor => {
 
 	const clipboard = accessor.get(IClipboardService);
-	const env = accessor.get(IEnvironmentService);
-
-	if (!env.performance) {
-		console.warn('no loader stats, start with `--performance`');
-		return;
-	}
 
 	let value = `Name\tDuration\n`;
 	for (let tick of getStats().get(LoaderEventType.BeginInvokeFactory)) {

@@ -3,9 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-'use strict';
-
-import Uri from 'vs/base/common/uri';
+import { URI as Uri } from 'vs/base/common/uri';
 import { createDecorator } from 'vs/platform/instantiation/common/instantiation';
 import { TPromise } from 'vs/base/common/winjs.base';
 import { IResolveContentOptions, IUpdateContentOptions, ITextSnapshot } from 'vs/platform/files/common/files';
@@ -23,11 +21,6 @@ export interface IBackupFileService {
 	_serviceBrand: any;
 
 	/**
-	 * If backups are enabled.
-	 */
-	backupEnabled: boolean;
-
-	/**
 	 * Finds out if there are any backups stored.
 	 */
 	hasBackups(): TPromise<boolean>;
@@ -38,7 +31,7 @@ export interface IBackupFileService {
 	 * @param resource The resource that is backed up.
 	 * @return The backup resource if any.
 	 */
-	loadBackupResource(resource: Uri): TPromise<Uri>;
+	loadBackupResource(resource: Uri): TPromise<Uri | undefined>;
 
 	/**
 	 * Given a resource, returns the associated backup resource.
@@ -52,10 +45,10 @@ export interface IBackupFileService {
 	 * Backs up a resource.
 	 *
 	 * @param resource The resource to back up.
-	 * @param content The content of the resource as value or snapshot.
+	 * @param content The content of the resource as snapshot.
 	 * @param versionId The version id of the resource to backup.
 	 */
-	backupResource(resource: Uri, content: string | ITextSnapshot, versionId?: number): TPromise<void>;
+	backupResource(resource: Uri, content: ITextSnapshot, versionId?: number): TPromise<void>;
 
 	/**
 	 * Gets a list of file backups for the current workspace.
@@ -65,13 +58,12 @@ export interface IBackupFileService {
 	getWorkspaceFileBackups(): TPromise<Uri[]>;
 
 	/**
-	 * Parses backup raw text content into the content, removing the metadata that is also stored
-	 * in the file.
+	 * Resolves the backup for the given resource.
 	 *
-	 * @param textBufferFactory The ITextBufferFactory from a backup resource.
-	 * @return The backup file's backed up content.
+	 * @param value The contents from a backup resource as stream.
+	 * @return The backup file's backed up content as text buffer factory.
 	 */
-	parseBackupContent(textBufferFactory: ITextBufferFactory): string;
+	resolveBackupContent(backup: Uri): TPromise<ITextBufferFactory | undefined>;
 
 	/**
 	 * Discards the backup associated with a resource if it exists..

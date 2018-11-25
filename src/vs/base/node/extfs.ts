@@ -3,17 +3,18 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-'use strict';
-
-import * as uuid from 'vs/base/common/uuid';
-import * as strings from 'vs/base/common/strings';
-import * as platform from 'vs/base/common/platform';
-import * as flow from 'vs/base/node/flow';
-
 import * as fs from 'fs';
 import * as paths from 'path';
-import { TPromise } from 'vs/base/common/winjs.base';
 import { nfcall } from 'vs/base/common/async';
+import { normalizeNFC } from 'vs/base/common/normalization';
+import * as platform from 'vs/base/common/platform';
+import * as strings from 'vs/base/common/strings';
+import * as uuid from 'vs/base/common/uuid';
+import { encode, encodeStream } from 'vs/base/node/encoding';
+import * as flow from 'vs/base/node/flow';
+import { CancellationToken } from 'vs/base/common/cancellation';
+import { IDisposable, toDisposable, Disposable } from 'vs/base/common/lifecycle';
+import { TPromise } from 'vs/base/common/winjs.base';
 
 const loop = flow.loop;
 
@@ -21,32 +22,51 @@ export function readdirSync(path: string): string[] {
 	// Mac: uses NFD unicode form on disk, but we want NFC
 	// See also https://github.com/nodejs/node/issues/2165
 	if (platform.isMacintosh) {
-		return fs.readdirSync(path).map(c => strings.normalizeNFC(c));
+		return fs.readdirSync(path).map(c => normalizeNFC(c));
 	}
 
 	return fs.readdirSync(path);
 }
 
-export function readdir(path: string, callback: (error: Error, files: string[]) => void): void {
+export function readdir(path: string, callback: (error: Error | null, files: string[]) => void): void {
 	// Mac: uses NFD unicode form on disk, but we want NFC
 	// See also https://github.com/nodejs/node/issues/2165
 	if (platform.isMacintosh) {
 		return fs.readdir(path, (error, children) => {
 			if (error) {
-				return callback(error, null);
+				return callback(error, []);
 			}
 
-			return callback(null, children.map(c => strings.normalizeNFC(c)));
+			return callback(null, children.map(c => normalizeNFC(c)));
 		});
 	}
 
 	return fs.readdir(path, callback);
 }
 
-export function copy(source: string, target: string, callback: (error: Error) => void, copiedSources?: { [path: string]: boolean }): void {
-	if (!copiedSources) {
-		copiedSources = Object.create(null);
-	}
+export interface IStatAndLink {
+	stat: fs.Stats;
+	isSymbolicLink: boolean;
+}
+
+export function statLink(path: string, callback: (error: Error | null, statAndIsLink: IStatAndLink | null) => void): void {
+	fs.lstat(path, (error, lstat) => {
+		if (error || lstat.isSymbolicLink()) {
+			fs.stat(path, (error, stat) => {
+				if (error) {
+					return callback(error, null);
+				}
+
+				callback(null, { stat, isSymbolicLink: lstat && lstat.isSymbolicLink() });
+			});
+		} else {
+			callback(null, { stat: lstat, isSymbolicLink: false });
+		}
+	});
+}
+
+export function copy(source: string, target: string, callback: (error: Error | null) => void, copiedSourcesIn?: { [path: string]: boolean }): void {
+	const copiedSources = copiedSourcesIn ? copiedSourcesIn : Object.create(null);
 
 	fs.stat(source, (error, stat) => {
 		if (error) {
@@ -65,13 +85,13 @@ export function copy(source: string, target: string, callback: (error: Error) =>
 
 		const proceed = function () {
 			readdir(source, (err, files) => {
-				loop(files, (file: string, clb: (error: Error, result: string[]) => void) => {
-					copy(paths.join(source, file), paths.join(target, file), (error: Error) => clb(error, void 0), copiedSources);
+				loop(files, (file: string, clb: (error: Error | null, result: string[]) => void) => {
+					copy(paths.join(source, file), paths.join(target, file), (error: Error) => clb(error, []), copiedSources);
 				}, callback);
 			});
 		};
 
-		mkdirp(target, stat.mode & 511).done(proceed, proceed);
+		mkdirp(target, stat.mode & 511).then(proceed, proceed);
 	});
 }
 
@@ -107,18 +127,28 @@ function doCopyFile(source: string, target: string, mode: number, callback: (err
 	reader.pipe(writer);
 }
 
-export function mkdirp(path: string, mode?: number): TPromise<boolean> {
-	const mkdir = () => nfcall(fs.mkdir, path, mode)
-		.then(null, (err: NodeJS.ErrnoException) => {
-			if (err.code === 'EEXIST') {
-				return nfcall(fs.stat, path)
-					.then((stat: fs.Stats) => stat.isDirectory
-						? null
-						: TPromise.wrapError(new Error(`'${path}' exists and is not a directory.`)));
+export function mkdirp(path: string, mode?: number, token?: CancellationToken): TPromise<boolean> {
+	const mkdir = (): Promise<null> => {
+		return nfcall(fs.mkdir, path, mode).then(null, (mkdirErr: NodeJS.ErrnoException) => {
+
+			// ENOENT: a parent folder does not exist yet
+			if (mkdirErr.code === 'ENOENT') {
+				return TPromise.wrapError(mkdirErr);
 			}
 
-			return TPromise.wrapError<boolean>(err);
+			// Any other error: check if folder exists and
+			// return normally in that case if its a folder
+			return nfcall(fs.stat, path).then((stat: fs.Stats) => {
+				if (!stat.isDirectory()) {
+					return TPromise.wrapError(new Error(`'${path}' exists and is not a directory.`));
+				}
+
+				return null;
+			}, statErr => {
+				return TPromise.wrapError(mkdirErr); // bubble up original mkdir error
+			});
 		});
+	};
 
 	// stop at root
 	if (path === paths.dirname(path)) {
@@ -127,11 +157,20 @@ export function mkdirp(path: string, mode?: number): TPromise<boolean> {
 
 	// recursively mkdir
 	return mkdir().then(null, (err: NodeJS.ErrnoException) => {
+
+		// Respect cancellation
+		if (token && token.isCancellationRequested) {
+			return TPromise.as(false);
+		}
+
+		// ENOENT: a parent folder does not exist yet, continue
+		// to create the parent folder and then try again.
 		if (err.code === 'ENOENT') {
 			return mkdirp(paths.dirname(path), mode).then(mkdir);
 		}
 
-		return TPromise.wrapError<boolean>(err);
+		// Any other error
+		return TPromise.wrapError(err);
 	});
 }
 
@@ -139,7 +178,7 @@ export function mkdirp(path: string, mode?: number): TPromise<boolean> {
 // after the rename, the contents are out of the workspace although not yet deleted. The greater benefit however is that this operation
 // will fail in case any file is used by another process. fs.unlink() in node will not bail if a file unlinked is used by another process.
 // However, the consequences are bad as outlined in all the related bugs from https://github.com/joyent/node/issues/7164
-export function del(path: string, tmpFolder: string, callback: (error: Error) => void, done?: (error: Error) => void): void {
+export function del(path: string, tmpFolder: string, callback: (error: Error | null) => void, done?: (error: Error | null) => void): void {
 	fs.exists(path, exists => {
 		if (!exists) {
 			return callback(null);
@@ -157,7 +196,7 @@ export function del(path: string, tmpFolder: string, callback: (error: Error) =>
 			}
 
 			const pathInTemp = paths.join(tmpFolder, uuid.generateUuid());
-			fs.rename(path, pathInTemp, (error: Error) => {
+			fs.rename(path, pathInTemp, (error: Error | null) => {
 				if (error) {
 					return rmRecursive(path, callback); // if rename fails, delete without tmp dir
 				}
@@ -180,7 +219,7 @@ export function del(path: string, tmpFolder: string, callback: (error: Error) =>
 	});
 }
 
-function rmRecursive(path: string, callback: (error: Error) => void): void {
+function rmRecursive(path: string, callback: (error: Error | null) => void): void {
 	if (path === '\\' || path === '/') {
 		return callback(new Error('Will not delete root!'));
 	}
@@ -212,7 +251,7 @@ function rmRecursive(path: string, callback: (error: Error) => void): void {
 						} else if (children.length === 0) {
 							fs.rmdir(path, callback);
 						} else {
-							let firstError: Error = null;
+							let firstError: Error | null = null;
 							let childrenLeft = children.length;
 							children.forEach(child => {
 								rmRecursive(paths.join(path, child), (err: Error) => {
@@ -256,12 +295,12 @@ export function delSync(path: string): void {
 	}
 }
 
-export function mv(source: string, target: string, callback: (error: Error) => void): void {
+export function mv(source: string, target: string, callback: (error: Error | null) => void): void {
 	if (source === target) {
 		return callback(null);
 	}
 
-	function updateMtime(err: Error): void {
+	function updateMtime(err: Error | null): void {
 		if (err) {
 			return callback(err);
 		}
@@ -319,8 +358,17 @@ export function mv(source: string, target: string, callback: (error: Error) => v
 	});
 }
 
+export interface IWriteFileOptions {
+	mode?: number;
+	flag?: string;
+	encoding?: {
+		charset: string;
+		addBOM: boolean;
+	};
+}
+
 let canFlush = true;
-export function writeFileAndFlush(path: string, data: string | NodeBuffer | NodeJS.ReadableStream, options: { mode?: number; flag?: string; }, callback: (error?: Error) => void): void {
+export function writeFileAndFlush(path: string, data: string | Buffer | NodeJS.ReadableStream, options: IWriteFileOptions, callback: (error?: Error) => void): void {
 	options = ensureOptions(options);
 
 	if (typeof data === 'string' || Buffer.isBuffer(data)) {
@@ -330,7 +378,7 @@ export function writeFileAndFlush(path: string, data: string | NodeBuffer | Node
 	}
 }
 
-function doWriteFileStreamAndFlush(path: string, reader: NodeJS.ReadableStream, options: { mode?: number; flag?: string; }, callback: (error?: Error) => void): void {
+function doWriteFileStreamAndFlush(path: string, reader: NodeJS.ReadableStream, options: IWriteFileOptions, callback: (error?: Error) => void): void {
 
 	// finish only once
 	let finished = false;
@@ -361,13 +409,24 @@ function doWriteFileStreamAndFlush(path: string, reader: NodeJS.ReadableStream, 
 	const writer = fs.createWriteStream(path, { mode: options.mode, flags: options.flag, autoClose: false });
 
 	// Event: 'open'
-	// Purpose: save the fd for later use
+	// Purpose: save the fd for later use and start piping
 	// Notes: will not be called when there is an error opening the file descriptor!
 	let fd: number;
 	let isOpen: boolean;
 	writer.once('open', descriptor => {
 		fd = descriptor;
 		isOpen = true;
+
+		// if an encoding is provided, we need to pipe the stream through
+		// an encoder stream and forward the encoding related options
+		if (options.encoding) {
+			reader = reader.pipe(encodeStream(options.encoding.charset, { addBOM: options.encoding.addBOM }));
+		}
+
+		// start data piping only when we got a successful open. this ensures that we do
+		// not consume the stream when an error happens and helps to fix this issue:
+		// https://github.com/Microsoft/vscode/issues/42542
+		reader.pipe(writer);
 	});
 
 	// Event: 'error'
@@ -403,9 +462,6 @@ function doWriteFileStreamAndFlush(path: string, reader: NodeJS.ReadableStream, 
 	// Purpose: signal we are done to the outside
 	// Notes: event is called when the writer's filedescriptor is closed
 	writer.once('close', () => finish());
-
-	// start data piping
-	reader.pipe(writer);
 }
 
 // Calls fs.writeFile() followed by a fs.sync() call to flush the changes to disk
@@ -413,13 +469,17 @@ function doWriteFileStreamAndFlush(path: string, reader: NodeJS.ReadableStream, 
 // not in some cache.
 //
 // See https://github.com/nodejs/node/blob/v5.10.0/lib/fs.js#L1194
-function doWriteFileAndFlush(path: string, data: string | NodeBuffer, options: { mode?: number; flag?: string; }, callback: (error?: Error) => void): void {
+function doWriteFileAndFlush(path: string, data: string | Buffer, options: IWriteFileOptions, callback: (error?: Error) => void): void {
+	if (options.encoding) {
+		data = encode(data, options.encoding.charset, { addBOM: options.encoding.addBOM });
+	}
+
 	if (!canFlush) {
-		return fs.writeFile(path, data, options, callback);
+		return fs.writeFile(path, data, { mode: options.mode, flag: options.flag }, callback);
 	}
 
 	// Open the file with same flags and mode as fs.writeFile()
-	fs.open(path, options.flag, options.mode, (openError, fd) => {
+	fs.open(path, typeof options.flag === 'string' ? options.flag : 'r', options.mode, (openError, fd) => {
 		if (openError) {
 			return callback(openError);
 		}
@@ -446,15 +506,19 @@ function doWriteFileAndFlush(path: string, data: string | NodeBuffer, options: {
 	});
 }
 
-export function writeFileAndFlushSync(path: string, data: string | NodeBuffer, options?: { mode?: number; flag?: string; }): void {
+export function writeFileAndFlushSync(path: string, data: string | Buffer, options?: IWriteFileOptions): void {
 	options = ensureOptions(options);
 
+	if (options.encoding) {
+		data = encode(data, options.encoding.charset, { addBOM: options.encoding.addBOM });
+	}
+
 	if (!canFlush) {
-		return fs.writeFileSync(path, data, options);
+		return fs.writeFileSync(path, data, { mode: options.mode, flag: options.flag });
 	}
 
 	// Open the file with same flags and mode as fs.writeFile()
-	const fd = fs.openSync(path, options.flag, options.mode);
+	const fd = fs.openSync(path, typeof options.flag === 'string' ? options.flag : 'r', options.mode);
 
 	try {
 
@@ -473,12 +537,12 @@ export function writeFileAndFlushSync(path: string, data: string | NodeBuffer, o
 	}
 }
 
-function ensureOptions(options?: { mode?: number; flag?: string; }): { mode: number, flag: string } {
+function ensureOptions(options?: IWriteFileOptions): IWriteFileOptions {
 	if (!options) {
 		return { mode: 0o666, flag: 'w' };
 	}
 
-	const ensuredOptions = { mode: options.mode, flag: options.flag };
+	const ensuredOptions: IWriteFileOptions = { mode: options.mode, flag: options.flag, encoding: options.encoding };
 
 	if (typeof ensuredOptions.mode !== 'number') {
 		ensuredOptions.mode = 0o666;
@@ -500,7 +564,7 @@ function ensureOptions(options?: { mode?: number; flag?: string; }): { mode: num
  * In case of errors, null is returned. But you cannot use this function to verify that a path exists.
  * realcaseSync does not handle '..' or '.' path segments and it does not take the locale into account.
  */
-export function realcaseSync(path: string): string {
+export function realcaseSync(path: string): string | null {
 	const dir = paths.dirname(path);
 	if (path === dir) {	// end recursion
 		return path;
@@ -550,7 +614,7 @@ export function realpathSync(path: string): string {
 	}
 }
 
-export function realpath(path: string, callback: (error: Error, realpath: string) => void): void {
+export function realpath(path: string, callback: (error: Error | null, realpath: string) => void): void {
 	return fs.realpath(path, (error, realpath) => {
 		if (!error) {
 			return callback(null, realpath);
@@ -573,21 +637,73 @@ function normalizePath(path: string): string {
 	return strings.rtrim(paths.normalize(path), paths.sep);
 }
 
-export function watch(path: string, onChange: (type: string, path: string) => void): fs.FSWatcher {
-	const watcher = fs.watch(path);
-	watcher.on('change', (type, raw) => {
-		let file: string = null;
-		if (raw) { // https://github.com/Microsoft/vscode/issues/38191
-			file = raw.toString();
-			if (platform.isMacintosh) {
-				// Mac: uses NFD unicode form on disk, but we want NFC
-				// See also https://github.com/nodejs/node/issues/2165
-				file = strings.normalizeNFC(file);
+export function watch(path: string, onChange: (type: string, path?: string) => void, onError: (error: string) => void): IDisposable {
+	try {
+		const watcher = fs.watch(path);
+
+		watcher.on('change', (type, raw) => {
+			let file: string | undefined;
+			if (raw) { // https://github.com/Microsoft/vscode/issues/38191
+				file = raw.toString();
+				if (platform.isMacintosh) {
+					// Mac: uses NFD unicode form on disk, but we want NFC
+					// See also https://github.com/nodejs/node/issues/2165
+					file = normalizeNFC(file);
+				}
 			}
+
+			onChange(type, file);
+		});
+
+		watcher.on('error', (code: number, signal: string) => onError(`Failed to watch ${path} for changes (${code}, ${signal})`));
+
+		return toDisposable(() => {
+			watcher.removeAllListeners();
+			watcher.close();
+		});
+	} catch (error) {
+		fs.exists(path, exists => {
+			if (exists) {
+				onError(`Failed to watch ${path} for changes (${error.toString()})`);
+			}
+		});
+	}
+
+	return Disposable.None;
+}
+
+export function sanitizeFilePath(candidate: string, cwd: string): string {
+
+	// Special case: allow to open a drive letter without trailing backslash
+	if (platform.isWindows && strings.endsWith(candidate, ':')) {
+		candidate += paths.sep;
+	}
+
+	// Ensure absolute
+	if (!paths.isAbsolute(candidate)) {
+		candidate = paths.join(cwd, candidate);
+	}
+
+	// Ensure normalized
+	candidate = paths.normalize(candidate);
+
+	// Ensure no trailing slash/backslash
+	if (platform.isWindows) {
+		candidate = strings.rtrim(candidate, paths.sep);
+
+		// Special case: allow to open drive root ('C:\')
+		if (strings.endsWith(candidate, ':')) {
+			candidate += paths.sep;
 		}
 
-		onChange(type, file);
-	});
+	} else {
+		candidate = strings.rtrim(candidate, paths.sep);
 
-	return watcher;
+		// Special case: allow to open root ('/')
+		if (!candidate) {
+			candidate = paths.sep;
+		}
+	}
+
+	return candidate;
 }

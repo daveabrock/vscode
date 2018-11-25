@@ -3,9 +3,8 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-'use strict';
-
-import { ILocalExtension, IGalleryExtension, EXTENSION_IDENTIFIER_REGEX, IExtensionIdentifier } from 'vs/platform/extensionManagement/common/extensionManagement';
+import { ILocalExtension, IGalleryExtension, IExtensionIdentifier, IReportedExtension } from 'vs/platform/extensionManagement/common/extensionManagement';
+import { compareIgnoreCase } from 'vs/base/common/strings';
 
 export function areSameExtensions(a: IExtensionIdentifier, b: IExtensionIdentifier): boolean {
 	if (a.uuid && b.uuid) {
@@ -14,15 +13,19 @@ export function areSameExtensions(a: IExtensionIdentifier, b: IExtensionIdentifi
 	if (a.id === b.id) {
 		return true;
 	}
-	return adoptToGalleryExtensionId(a.id) === adoptToGalleryExtensionId(b.id);
+	return compareIgnoreCase(a.id, b.id) === 0;
+}
+
+export function adoptToGalleryExtensionId(id: string): string {
+	return id.toLocaleLowerCase();
 }
 
 export function getGalleryExtensionId(publisher: string, name: string): string {
-	return `${publisher}.${name.toLocaleLowerCase()}`;
+	return `${publisher.toLocaleLowerCase()}.${name.toLocaleLowerCase()}`;
 }
 
 export function getGalleryExtensionIdFromLocal(local: ILocalExtension): string {
-	return getGalleryExtensionId(local.manifest.publisher, local.manifest.name);
+	return local.manifest ? getGalleryExtensionId(local.manifest.publisher, local.manifest.name) : local.identifier.id;
 }
 
 export const LOCAL_EXTENSION_ID_REGEX = /^([^.]+\..+)-(\d+\.\d+\.\d+(-.*)?)$/;
@@ -35,8 +38,8 @@ export function getIdFromLocalExtensionId(localExtensionId: string): string {
 	return adoptToGalleryExtensionId(localExtensionId);
 }
 
-export function adoptToGalleryExtensionId(id: string): string {
-	return id.replace(EXTENSION_IDENTIFIER_REGEX, (match, publisher: string, name: string) => getGalleryExtensionId(publisher, name));
+export function getLocalExtensionId(id: string, version: string): string {
+	return `${id}-${version}`;
 }
 
 export function groupByExtension<T>(extensions: T[], getExtensionIdentifier: (t: T) => IExtensionIdentifier): T[][] {
@@ -78,10 +81,10 @@ export function getLocalExtensionTelemetryData(extension: ILocalExtension): any 
 		"id" : { "classification": "SystemMetaData", "purpose": "FeatureInsight" },
 		"name": { "classification": "SystemMetaData", "purpose": "FeatureInsight" },
 		"galleryId": { "classification": "SystemMetaData", "purpose": "FeatureInsight" },
-		"publisherId": { "classification": "PublicNonPersonalData", "purpose": "FeatureInsight" },
-		"publisherName": { "classification": "PublicNonPersonalData", "purpose": "FeatureInsight" },
-		"publisherDisplayName": { "classification": "PublicPersonalData", "purpose": "FeatureInsight" },
-		"dependencies": { "classification": "SystemMetaData", "purpose": "FeatureInsight" },
+		"publisherId": { "classification": "SystemMetaData", "purpose": "FeatureInsight" },
+		"publisherName": { "classification": "SystemMetaData", "purpose": "FeatureInsight" },
+		"publisherDisplayName": { "classification": "SystemMetaData", "purpose": "FeatureInsight" },
+		"dependencies": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "isMeasurement": true },
 		"${include}": [
 			"${GalleryExtensionTelemetryData2}"
 		]
@@ -95,10 +98,22 @@ export function getGalleryExtensionTelemetryData(extension: IGalleryExtension): 
 		publisherId: extension.publisherId,
 		publisherName: extension.publisher,
 		publisherDisplayName: extension.publisherDisplayName,
-		dependencies: extension.properties.dependencies.length > 0,
+		dependencies: !!(extension.properties.dependencies && extension.properties.dependencies.length > 0),
 		...extension.telemetryData
 	};
 }
 
 export const BetterMergeDisabledNowKey = 'extensions/bettermergedisablednow';
 export const BetterMergeId = 'pprice.better-merge';
+
+export function getMaliciousExtensionsSet(report: IReportedExtension[]): Set<string> {
+	const result = new Set<string>();
+
+	for (const extension of report) {
+		if (extension.malicious) {
+			result.add(extension.id.id);
+		}
+	}
+
+	return result;
+}

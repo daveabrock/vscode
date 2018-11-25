@@ -3,17 +3,16 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-'use strict';
-
-import { workspace, WorkspaceFoldersChangeEvent, Uri, window, Event, EventEmitter, QuickPickItem, Disposable, SourceControl, SourceControlResourceGroup, TextEditor, Memento, ConfigurationChangeEvent } from 'vscode';
+import { workspace, WorkspaceFoldersChangeEvent, Uri, window, Event, EventEmitter, QuickPickItem, Disposable, SourceControl, SourceControlResourceGroup, TextEditor, Memento, OutputChannel } from 'vscode';
 import { Repository, RepositoryState } from './repository';
 import { memoize, sequentialize, debounce } from './decorators';
-import { dispose, anyEvent, filterEvent, IDisposable, isDescendant, find, firstIndex } from './util';
-import { Git, GitErrorCodes } from './git';
+import { dispose, anyEvent, filterEvent, isDescendant, firstIndex } from './util';
+import { Git } from './git';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as nls from 'vscode-nls';
 import { fromGitUri } from './uri';
+import { GitErrorCodes } from './api/git';
 
 const localize = nls.loadMessageBundle();
 
@@ -66,7 +65,7 @@ export class Model {
 
 	private disposables: Disposable[] = [];
 
-	constructor(private git: Git, private globalState: Memento) {
+	constructor(readonly git: Git, private globalState: Memento, private outputChannel: OutputChannel) {
 		workspace.onDidChangeWorkspaceFolders(this.onDidChangeWorkspaceFolders, this, this.disposables);
 		this.onDidChangeWorkspaceFolders({ added: workspace.workspaceFolders || [], removed: [] });
 
@@ -91,13 +90,37 @@ export class Model {
 	 * for git repositories.
 	 */
 	private async scanWorkspaceFolders(): Promise<void> {
+		const config = workspace.getConfiguration('git');
+		const autoRepositoryDetection = config.get<boolean | 'subFolders' | 'openEditors'>('autoRepositoryDetection');
+
+		if (autoRepositoryDetection !== true && autoRepositoryDetection !== 'subFolders') {
+			return;
+		}
+
 		for (const folder of workspace.workspaceFolders || []) {
 			const root = folder.uri.fsPath;
-			const children = await new Promise<string[]>((c, e) => fs.readdir(root, (err, r) => err ? e(err) : c(r)));
 
-			children
-				.filter(child => child !== '.git')
-				.forEach(child => this.tryOpenRepository(path.join(root, child)));
+			try {
+				const children = await new Promise<string[]>((c, e) => fs.readdir(root, (err, r) => err ? e(err) : c(r)));
+
+				children
+					.filter(child => child !== '.git')
+					.forEach(child => this.openRepository(path.join(root, child)));
+
+				const folderConfig = workspace.getConfiguration('git', folder.uri);
+				const paths = folderConfig.get<string[]>('scanRepositories') || [];
+
+				for (const possibleRepositoryPath of paths) {
+					if (path.isAbsolute(possibleRepositoryPath)) {
+						console.warn(localize('not supported', "Absolute paths not supported in 'git.scanRepositories' setting."));
+						continue;
+					}
+
+					this.openRepository(path.join(root, possibleRepositoryPath));
+				}
+			} catch (err) {
+				// noop
+			}
 		}
 	}
 
@@ -113,7 +136,7 @@ export class Model {
 	@debounce(500)
 	private eventuallyScanPossibleGitRepositories(): void {
 		for (const path of this.possibleGitRepositoryPaths) {
-			this.tryOpenRepository(path);
+			this.openRepository(path);
 		}
 
 		this.possibleGitRepositoryPaths.clear();
@@ -134,7 +157,7 @@ export class Model {
 			.filter(r => !activeRepositories.has(r!.repository))
 			.filter(r => !(workspace.workspaceFolders || []).some(f => isDescendant(f.uri.fsPath, r!.repository.root))) as OpenRepository[];
 
-		possibleRepositoryFolders.forEach(p => this.tryOpenRepository(p.uri.fsPath));
+		possibleRepositoryFolders.forEach(p => this.openRepository(p.uri.fsPath));
 		openRepositoriesToDispose.forEach(r => r.dispose());
 	}
 
@@ -148,15 +171,15 @@ export class Model {
 			.filter(({ root }) => workspace.getConfiguration('git', root).get<boolean>('enabled') !== true)
 			.map(({ repository }) => repository);
 
-		possibleRepositoryFolders.forEach(p => this.tryOpenRepository(p.uri.fsPath));
+		possibleRepositoryFolders.forEach(p => this.openRepository(p.uri.fsPath));
 		openRepositoriesToDispose.forEach(r => r.dispose());
 	}
 
 	private onDidChangeVisibleTextEditors(editors: TextEditor[]): void {
 		const config = workspace.getConfiguration('git');
-		const enabled = config.get<boolean>('autoRepositoryDetection') === true;
+		const autoRepositoryDetection = config.get<boolean | 'subFolders' | 'openEditors'>('autoRepositoryDetection');
 
-		if (!enabled) {
+		if (autoRepositoryDetection !== true && autoRepositoryDetection !== 'openEditors') {
 			return;
 		}
 
@@ -173,12 +196,12 @@ export class Model {
 				return;
 			}
 
-			this.tryOpenRepository(path.dirname(uri.fsPath));
+			this.openRepository(path.dirname(uri.fsPath));
 		});
 	}
 
 	@sequentialize
-	async tryOpenRepository(path: string): Promise<void> {
+	async openRepository(path: string): Promise<void> {
 		if (this.getRepository(path)) {
 			return;
 		}
@@ -191,12 +214,21 @@ export class Model {
 		}
 
 		try {
-			const repositoryRoot = await this.git.getRepositoryRoot(path);
+			const rawRoot = await this.git.getRepositoryRoot(path);
 
 			// This can happen whenever `path` has the wrong case sensitivity in
 			// case insensitive file systems
 			// https://github.com/Microsoft/vscode/issues/33498
+			const repositoryRoot = Uri.file(rawRoot).fsPath;
+
 			if (this.getRepository(repositoryRoot)) {
+				return;
+			}
+
+			const config = workspace.getConfiguration('git');
+			const ignoredRepos = new Set(config.get<Array<string>>('ignoredRepositories'));
+
+			if (ignoredRepos.has(rawRoot)) {
 				return;
 			}
 
@@ -213,18 +245,39 @@ export class Model {
 	}
 
 	private open(repository: Repository): void {
+		this.outputChannel.appendLine(`Open repository: ${repository.root}`);
+
 		const onDidDisappearRepository = filterEvent(repository.onDidChangeState, state => state === RepositoryState.Disposed);
 		const disappearListener = onDidDisappearRepository(() => dispose());
 		const changeListener = repository.onDidChangeRepository(uri => this._onDidChangeRepository.fire({ repository, uri }));
 		const originalResourceChangeListener = repository.onDidChangeOriginalResource(uri => this._onDidChangeOriginalResource.fire({ repository, uri }));
-		const scanSubmodules = () => {
+
+		const shouldDetectSubmodules = workspace
+			.getConfiguration('git', Uri.file(repository.root))
+			.get<boolean>('detectSubmodules') as boolean;
+
+		const submodulesLimit = workspace
+			.getConfiguration('git', Uri.file(repository.root))
+			.get<number>('detectSubmodulesLimit') as number;
+
+		const checkForSubmodules = () => {
+			if (!shouldDetectSubmodules) {
+				return;
+			}
+
+			if (repository.submodules.length > submodulesLimit) {
+				window.showWarningMessage(localize('too many submodules', "The '{0}' repository has {1} submodules which won't be opened automatically. You can still open each one individually by opening a file within.", path.basename(repository.root), repository.submodules.length));
+				statusListener.dispose();
+			}
+
 			repository.submodules
+				.slice(0, submodulesLimit)
 				.map(r => path.join(repository.root, r.path))
 				.forEach(p => this.eventuallyScanPossibleGitRepository(p));
 		};
 
-		const statusListener = repository.onDidRunGitStatus(scanSubmodules);
-		scanSubmodules();
+		const statusListener = repository.onDidRunGitStatus(checkForSubmodules);
+		checkForSubmodules();
 
 		const dispose = () => {
 			disappearListener.dispose();
@@ -249,6 +302,7 @@ export class Model {
 			return;
 		}
 
+		this.outputChannel.appendLine(`Close repository: ${repository.root}`);
 		openRepository.dispose();
 	}
 

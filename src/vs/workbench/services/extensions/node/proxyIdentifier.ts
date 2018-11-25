@@ -2,7 +2,6 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
-'use strict';
 
 export interface IRPCProtocol {
 	/**
@@ -22,34 +21,35 @@ export interface IRPCProtocol {
 }
 
 export class ProxyIdentifier<T> {
+	public static count = 0;
 	_proxyIdentifierBrand: void;
 	_suppressCompilerUnusedWarning: T;
 
 	public readonly isMain: boolean;
-	public readonly id: string;
-	public readonly isFancy: boolean;
+	public readonly sid: string;
+	public readonly nid: number;
 
-	constructor(isMain: boolean, id: string, isFancy: boolean) {
+	constructor(isMain: boolean, sid: string) {
 		this.isMain = isMain;
-		this.id = id;
-		this.isFancy = isFancy;
+		this.sid = sid;
+		this.nid = (++ProxyIdentifier.count);
 	}
 }
 
-export const enum ProxyType {
-	NativeJSON = 0,
-	CustomMarshaller = 1
+const identifiers: ProxyIdentifier<any>[] = [];
+
+export function createMainContextProxyIdentifier<T>(identifier: string): ProxyIdentifier<T> {
+	const result = new ProxyIdentifier<T>(true, identifier);
+	identifiers[result.nid] = result;
+	return result;
 }
 
-/**
- * Using `isFancy` indicates that arguments or results of type `URI` or `RegExp`
- * will be serialized/deserialized automatically, but this has a performance cost,
- * as each argument/result must be visited.
- */
-export function createMainContextProxyIdentifier<T>(identifier: string, type: ProxyType = ProxyType.NativeJSON): ProxyIdentifier<T> {
-	return new ProxyIdentifier(true, 'm' + identifier, type === ProxyType.CustomMarshaller);
+export function createExtHostContextProxyIdentifier<T>(identifier: string): ProxyIdentifier<T> {
+	const result = new ProxyIdentifier<T>(false, identifier);
+	identifiers[result.nid] = result;
+	return result;
 }
 
-export function createExtHostContextProxyIdentifier<T>(identifier: string, type: ProxyType = ProxyType.NativeJSON): ProxyIdentifier<T> {
-	return new ProxyIdentifier(false, 'e' + identifier, type === ProxyType.CustomMarshaller);
+export function getStringIdentifierForProxy(nid: number): string {
+	return identifiers[nid].sid;
 }

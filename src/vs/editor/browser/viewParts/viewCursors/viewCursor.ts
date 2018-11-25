@@ -2,17 +2,17 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
-'use strict';
 
+import * as dom from 'vs/base/browser/dom';
 import { FastDomNode, createFastDomNode } from 'vs/base/browser/fastDomNode';
+import * as strings from 'vs/base/common/strings';
+import { Configuration } from 'vs/editor/browser/config/configuration';
+import { TextEditorCursorStyle } from 'vs/editor/common/config/editorOptions';
 import { Position } from 'vs/editor/common/core/position';
 import { Range } from 'vs/editor/common/core/range';
-import { TextEditorCursorStyle } from 'vs/editor/common/config/editorOptions';
-import { Configuration } from 'vs/editor/browser/config/configuration';
-import { ViewContext } from 'vs/editor/common/view/viewContext';
 import { RenderingContext, RestrictedRenderingContext } from 'vs/editor/common/view/renderingContext';
+import { ViewContext } from 'vs/editor/common/view/viewContext';
 import * as viewEvents from 'vs/editor/common/view/viewEvents';
-import * as dom from 'vs/base/browser/dom';
 
 export interface IViewCursorRenderData {
 	domNode: HTMLElement;
@@ -28,13 +28,13 @@ class ViewCursorRenderData {
 		public readonly left: number,
 		public readonly width: number,
 		public readonly height: number,
-		public readonly textContent: string
+		public readonly textContent: string,
+		public readonly textContentClassName: string
 	) { }
 }
 
 export class ViewCursor {
 	private readonly _context: ViewContext;
-	private readonly _isSecondary: boolean;
 	private readonly _domNode: FastDomNode<HTMLElement>;
 
 	private _cursorStyle: TextEditorCursorStyle;
@@ -47,26 +47,21 @@ export class ViewCursor {
 	private _position: Position;
 
 	private _lastRenderedContent: string;
-	private _renderData: ViewCursorRenderData;
+	private _renderData: ViewCursorRenderData | null;
 
-	constructor(context: ViewContext, isSecondary: boolean) {
+	constructor(context: ViewContext) {
 		this._context = context;
-		this._isSecondary = isSecondary;
 
 		this._cursorStyle = this._context.configuration.editor.viewInfo.cursorStyle;
 		this._lineHeight = this._context.configuration.editor.lineHeight;
 		this._typicalHalfwidthCharacterWidth = this._context.configuration.editor.fontInfo.typicalHalfwidthCharacterWidth;
-		this._lineCursorWidth = Math.min(this._context.configuration.editor.viewInfo.lineCursorWidth, this._typicalHalfwidthCharacterWidth);
+		this._lineCursorWidth = Math.min(this._context.configuration.editor.viewInfo.cursorWidth, this._typicalHalfwidthCharacterWidth);
 
 		this._isVisible = true;
 
 		// Create the dom node
 		this._domNode = createFastDomNode(document.createElement('div'));
-		if (this._isSecondary) {
-			this._domNode.setClassName('cursor secondary');
-		} else {
-			this._domNode.setClassName('cursor');
-		}
+		this._domNode.setClassName('cursor');
 		this._domNode.setHeight(this._lineHeight);
 		this._domNode.setTop(0);
 		this._domNode.setLeft(0);
@@ -111,7 +106,7 @@ export class ViewCursor {
 		}
 		if (e.viewInfo) {
 			this._cursorStyle = this._context.configuration.editor.viewInfo.cursorStyle;
-			this._lineCursorWidth = Math.min(this._context.configuration.editor.viewInfo.lineCursorWidth, this._typicalHalfwidthCharacterWidth);
+			this._lineCursorWidth = Math.min(this._context.configuration.editor.viewInfo.cursorWidth, this._typicalHalfwidthCharacterWidth);
 		}
 
 		return true;
@@ -122,8 +117,9 @@ export class ViewCursor {
 		return true;
 	}
 
-	private _prepareRender(ctx: RenderingContext): ViewCursorRenderData {
+	private _prepareRender(ctx: RenderingContext): ViewCursorRenderData | null {
 		let textContent = '';
+		let textContentClassName = '';
 
 		if (this._cursorStyle === TextEditorCursorStyle.Line || this._cursorStyle === TextEditorCursorStyle.LineThin) {
 			const visibleRange = ctx.visibleRangeForPosition(this._position);
@@ -134,15 +130,20 @@ export class ViewCursor {
 			let width: number;
 			if (this._cursorStyle === TextEditorCursorStyle.Line) {
 				width = dom.computeScreenAwareSize(this._lineCursorWidth > 0 ? this._lineCursorWidth : 2);
-				if (this._lineCursorWidth > 2) {
+				if (width > 2) {
 					const lineContent = this._context.model.getLineContent(this._position.lineNumber);
 					textContent = lineContent.charAt(this._position.column - 1);
 				}
 			} else {
 				width = dom.computeScreenAwareSize(1);
 			}
+			let left = visibleRange.left;
+			if (width >= 2 && left >= 1) {
+				// try to center cursor
+				left -= 1;
+			}
 			const top = ctx.getVerticalOffsetForLineNumber(this._position.lineNumber) - ctx.bigNumbersDelta;
-			return new ViewCursorRenderData(top, visibleRange.left, width, this._lineHeight, textContent);
+			return new ViewCursorRenderData(top, left, width, this._lineHeight, textContent, textContentClassName);
 		}
 
 		const visibleRangeForCharacter = ctx.linesVisibleRangesForRange(new Range(this._position.lineNumber, this._position.column, this._position.lineNumber, this._position.column + 1), false);
@@ -156,8 +157,13 @@ export class ViewCursor {
 		const width = range.width < 1 ? this._typicalHalfwidthCharacterWidth : range.width;
 
 		if (this._cursorStyle === TextEditorCursorStyle.Block) {
-			const lineContent = this._context.model.getLineContent(this._position.lineNumber);
-			textContent = lineContent.charAt(this._position.column - 1);
+			const lineData = this._context.model.getViewLineData(this._position.lineNumber);
+			textContent = lineData.content.charAt(this._position.column - 1);
+			if (strings.isHighSurrogate(lineData.content.charCodeAt(this._position.column - 1))) {
+				textContent += lineData.content.charAt(this._position.column);
+			}
+			const tokenIndex = lineData.tokens.findTokenIndexAtOffset(this._position.column - 1);
+			textContentClassName = lineData.tokens.getClassName(tokenIndex);
 		}
 
 		let top = ctx.getVerticalOffsetForLineNumber(this._position.lineNumber) - ctx.bigNumbersDelta;
@@ -169,14 +175,14 @@ export class ViewCursor {
 			height = 2;
 		}
 
-		return new ViewCursorRenderData(top, range.left, width, height, textContent);
+		return new ViewCursorRenderData(top, range.left, width, height, textContent, textContentClassName);
 	}
 
 	public prepareRender(ctx: RenderingContext): void {
 		this._renderData = this._prepareRender(ctx);
 	}
 
-	public render(ctx: RestrictedRenderingContext): IViewCursorRenderData {
+	public render(ctx: RestrictedRenderingContext): IViewCursorRenderData | null {
 		if (!this._renderData) {
 			this._domNode.setDisplay('none');
 			return null;
@@ -186,6 +192,8 @@ export class ViewCursor {
 			this._lastRenderedContent = this._renderData.textContent;
 			this._domNode.domNode.textContent = this._lastRenderedContent;
 		}
+
+		this._domNode.setClassName('cursor ' + this._renderData.textContentClassName);
 
 		this._domNode.setDisplay('block');
 		this._domNode.setTop(this._renderData.top);

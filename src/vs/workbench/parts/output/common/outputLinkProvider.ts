@@ -3,15 +3,12 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-'use strict';
-
-import { TPromise } from 'vs/base/common/winjs.base';
-import URI from 'vs/base/common/uri';
-import { RunOnceScheduler, wireCancellationToken } from 'vs/base/common/async';
+import { URI } from 'vs/base/common/uri';
+import { RunOnceScheduler } from 'vs/base/common/async';
 import { IModelService } from 'vs/editor/common/services/modelService';
 import { LinkProviderRegistry, ILink } from 'vs/editor/common/modes';
 import { IWorkspaceContextService } from 'vs/platform/workspace/common/workspace';
-import { OUTPUT_MODE_ID } from 'vs/workbench/parts/output/common/output';
+import { OUTPUT_MODE_ID, LOG_MODE_ID } from 'vs/workbench/parts/output/common/output';
 import { MonacoWebWorker, createWebWorker } from 'vs/editor/common/services/webWorker';
 import { ICreateData, OutputLinkComputer } from 'vs/workbench/parts/output/common/outputLinkComputer';
 import { IDisposable, dispose } from 'vs/base/common/lifecycle';
@@ -20,7 +17,7 @@ export class OutputLinkProvider {
 
 	private static readonly DISPOSE_WORKER_TIME = 3 * 60 * 1000; // dispose worker after 3 minutes of inactivity
 
-	private worker: MonacoWebWorker<OutputLinkComputer>;
+	private worker?: MonacoWebWorker<OutputLinkComputer>;
 	private disposeWorkerScheduler: RunOnceScheduler;
 	private linkProviderRegistration: IDisposable;
 
@@ -44,9 +41,9 @@ export class OutputLinkProvider {
 		const folders = this.contextService.getWorkspace().folders;
 		if (folders.length > 0) {
 			if (!this.linkProviderRegistration) {
-				this.linkProviderRegistration = LinkProviderRegistry.register({ language: OUTPUT_MODE_ID, scheme: '*' }, {
+				this.linkProviderRegistration = LinkProviderRegistry.register([{ language: OUTPUT_MODE_ID, scheme: '*' }, { language: LOG_MODE_ID, scheme: '*' }], {
 					provideLinks: (model, token): Thenable<ILink[]> => {
-						return wireCancellationToken(token, this.provideLinks(model.uri));
+						return this.provideLinks(model.uri);
 					}
 				});
 			}
@@ -77,7 +74,7 @@ export class OutputLinkProvider {
 		return this.worker;
 	}
 
-	private provideLinks(modelUri: URI): TPromise<ILink[]> {
+	private provideLinks(modelUri: URI): Promise<ILink[]> {
 		return this.getOrCreateWorker().withSyncedResources([modelUri]).then(linkComputer => {
 			return linkComputer.computeLinks(modelUri.toString());
 		});
@@ -86,7 +83,7 @@ export class OutputLinkProvider {
 	private disposeWorker(): void {
 		if (this.worker) {
 			this.worker.dispose();
-			this.worker = null;
+			this.worker = undefined;
 		}
 	}
 }

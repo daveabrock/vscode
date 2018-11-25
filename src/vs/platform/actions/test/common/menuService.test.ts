@@ -2,74 +2,15 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
-'use strict';
 
 import * as assert from 'assert';
-import { MenuRegistry, MenuId } from 'vs/platform/actions/common/actions';
+import { MenuRegistry, MenuId, isIMenuItem } from 'vs/platform/actions/common/actions';
 import { MenuService } from 'vs/platform/actions/common/menuService';
 import { IDisposable, dispose } from 'vs/base/common/lifecycle';
 import { NullCommandService } from 'vs/platform/commands/common/commands';
 import { MockContextKeyService } from 'vs/platform/keybinding/test/common/mockKeybindingService';
-import { IExtensionPoint } from 'vs/platform/extensions/common/extensionsRegistry';
-import { TPromise } from 'vs/base/common/winjs.base';
-import { ExtensionPointContribution, IExtensionDescription, IExtensionsStatus, IExtensionService, ProfileSession } from 'vs/platform/extensions/common/extensions';
-import Event, { Emitter } from 'vs/base/common/event';
 
 // --- service instances
-
-class MockExtensionService implements IExtensionService {
-
-	public _serviceBrand: any;
-
-	private _onDidRegisterExtensions = new Emitter<IExtensionDescription[]>();
-	public get onDidRegisterExtensions(): Event<IExtensionDescription[]> {
-		return this._onDidRegisterExtensions.event;
-	}
-
-	onDidChangeExtensionsStatus = null;
-
-	public activateByEvent(activationEvent: string): TPromise<void> {
-		throw new Error('Not implemented');
-	}
-
-	public whenInstalledExtensionsRegistered(): TPromise<boolean> {
-		return TPromise.as(true);
-	}
-
-	public getExtensions(): TPromise<IExtensionDescription[]> {
-		throw new Error('Not implemented');
-	}
-
-	public readExtensionPointContributions<T>(extPoint: IExtensionPoint<T>): TPromise<ExtensionPointContribution<T>[]> {
-		throw new Error('Not implemented');
-	}
-
-	public getExtensionsStatus(): { [id: string]: IExtensionsStatus; } {
-		throw new Error('Not implemented');
-	}
-
-	public startExtensionHostProfile(): TPromise<ProfileSession> {
-		throw new Error('Not implemented');
-	}
-
-	public restartExtensionHost(): void {
-		throw new Error('Method not implemented.');
-	}
-
-	public startExtensionHost(): void {
-		throw new Error('Method not implemented.');
-	}
-
-	public stopExtensionHost(): void {
-		throw new Error('Method not implemented.');
-	}
-
-	public getExtensionHostInformation(): any {
-		throw new Error('Method not implemented.');
-	}
-}
-
-const extensionService = new MockExtensionService();
 
 const contextKeyService = new class extends MockContextKeyService {
 	contextMatchesRules() {
@@ -86,8 +27,8 @@ suite('MenuService', function () {
 	let testMenuId: MenuId;
 
 	setup(function () {
-		menuService = new MenuService(extensionService, NullCommandService);
-		testMenuId = new MenuId();
+		menuService = new MenuService(NullCommandService);
+		testMenuId = Math.PI;
 		disposables = [];
 	});
 
@@ -245,13 +186,15 @@ suite('MenuService', function () {
 		let foundA = false;
 		let foundB = false;
 		for (const item of MenuRegistry.getMenuItems(MenuId.CommandPalette)) {
-			if (item.command.id === 'a') {
-				assert.equal(item.command.title, 'Explicit');
-				foundA = true;
-			}
-			if (item.command.id === 'b') {
-				assert.equal(item.command.title, 'Implicit');
-				foundB = true;
+			if (isIMenuItem(item)) {
+				if (item.command.id === 'a') {
+					assert.equal(item.command.title, 'Explicit');
+					foundA = true;
+				}
+				if (item.command.id === 'b') {
+					assert.equal(item.command.title, 'Implicit');
+					foundB = true;
+				}
 			}
 		}
 		assert.equal(foundA, true);
